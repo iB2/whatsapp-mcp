@@ -1,0 +1,10 @@
+{
+  "ignore_chats": [
+    "120363000000000000@g.us",
+    "120363000000000001@g.us"
+  ],
+  "_comments": {
+    "120363000000000000@g.us": "Example: Noisy group chat 1",
+    "120363000000000001@g.us": "Example: Noisy group chat 2"
+  }
+}

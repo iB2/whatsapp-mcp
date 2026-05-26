@@ -44,6 +44,10 @@ from whatsapp import (
     send_message as whatsapp_send_message,
 )
 
+from whatsapp import (
+    analyze_chats as whatsapp_analyze_chats,
+)
+
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
 
@@ -360,6 +364,33 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
     else:
         return {"success": False, "message": "Failed to download media"}
 
+
+
+
+@mcp.tool()
+def analyze_chats(
+    days_inactive: int = 30,
+    offender_threshold: int = 1000,
+    participation_threshold: float = 5.0,
+) -> dict[str, Any]:
+    """Analyze all WhatsApp group chats and generate a health report.
+
+    Identifies high-volume low-participation groups (offenders), inactive groups,
+    and provides recommendations for which groups to filter.
+
+    Args:
+        days_inactive: Days since last message to consider a group inactive (default 30)
+        offender_threshold: Message count threshold for offender classification (default 1000)
+        participation_threshold: Minimum user participation percentage (default 5.0)
+
+    Returns:
+        Report with summary, group details, categories, and filter recommendations.
+    """
+    return whatsapp_analyze_chats(
+        days_inactive=days_inactive,
+        offender_threshold=offender_threshold,
+        participation_threshold=participation_threshold / 100.0,
+    )
 
 def shutdown_handler(signum, frame):
     """Handle shutdown signals gracefully to prevent zombie processes."""

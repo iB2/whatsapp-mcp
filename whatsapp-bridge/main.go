@@ -24,6 +24,7 @@ import (
 	"github.com/mdp/qrterminal"
 
 	"bytes"
+	"sync"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -46,6 +47,8 @@ var forwardSelfMessages = getEnvBool("FORWARD_SELF", true)
 var fullHistoryPairFlag = flag.Bool("full-history-pair", false,
 	"Request full history at pair time (only effective when re-pairing; no-op for existing sessions)")
 
+var chatFilter *ChatFilter
+
 // getEnvBool reads a boolean env var with a default.
 // Accepts: 1/true/yes/on and 0/false/no/off (case-insensitive)
 func getEnvBool(key string, def bool) bool {
@@ -61,6 +64,58 @@ func getEnvBool(key string, def bool) bool {
 	default:
 		return def
 	}
+}
+
+// ChatFilter manages a set of chat JIDs to ignore. It loads from a JSON file
+// on disk and hot-reloads when the file changes (checked on each call).
+type ChatFilter struct {
+	mu       sync.RWMutex
+	ignored  map[string]bool
+	path     string
+	modTime  time.Time
+}
+
+type chatFilterFile struct {
+	IgnoreChats []string `json:"ignore_chats"`
+}
+
+func NewChatFilter(path string) *ChatFilter {
+	cf := &ChatFilter{path: path, ignored: make(map[string]bool)}
+	cf.reload()
+	return cf
+}
+
+func (cf *ChatFilter) reload() {
+	info, err := os.Stat(cf.path)
+	if err != nil {
+		return
+	}
+	if !info.ModTime().After(cf.modTime) {
+		return
+	}
+	data, err := os.ReadFile(cf.path)
+	if err != nil {
+		return
+	}
+	var f chatFilterFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return
+	}
+	m := make(map[string]bool, len(f.IgnoreChats))
+	for _, jid := range f.IgnoreChats {
+		m[jid] = true
+	}
+	cf.mu.Lock()
+	cf.ignored = m
+	cf.modTime = info.ModTime()
+	cf.mu.Unlock()
+}
+
+func (cf *ChatFilter) IsIgnored(chatJID string) bool {
+	cf.reload()
+	cf.mu.RLock()
+	defer cf.mu.RUnlock()
+	return cf.ignored[chatJID]
 }
 
 // Message represents a chat message for our client
@@ -1397,6 +1452,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// and outgoing messages land in the same chat entry.
 	resolvedChat := resolveLIDChat(client, msg.Info.Chat, msg.Info.SenderAlt, msg.Info.RecipientAlt, msg.Info.IsFromMe)
 	chatJID := resolvedChat.String()
+
+	if chatFilter != nil && chatFilter.IsIgnored(chatJID) {
+		return
+	}
+
 	// Resolve the *sender* with a sender-specific alt so that outgoing-from-self
 	// messages don't get tagged with the recipient's phone number, and incoming
 	// messages from LID-only peers get rewritten to their phone user-part when
@@ -2052,6 +2112,9 @@ func main() {
 		logger.Infof("FORWARD_SELF disabled: self messages will NOT be forwarded")
 	}
 
+	chatFilter = NewChatFilter("store/ignore-chats.json")
+	logger.Infof("Chat filter loaded from store/ignore-chats.json (%d chats ignored)", len(chatFilter.ignored))
+
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
@@ -2601,6 +2664,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		// LID store mapping populated during live message handling.
 		resolved := resolveLIDChat(client, jid, types.EmptyJID, types.EmptyJID, false)
 		chatJID := resolved.String()
+
+		if chatFilter != nil && chatFilter.IsIgnored(chatJID) {
+			continue
+		}
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, resolved, chatJID, conversation, "", logger)

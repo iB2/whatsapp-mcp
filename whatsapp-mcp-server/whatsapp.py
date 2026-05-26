@@ -1107,3 +1107,162 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def analyze_chats(
+    days_inactive: int = 30,
+    offender_threshold: int = 1000,
+    participation_threshold: float = 0.05,
+) -> dict[str, Any]:
+    """Analyze all WhatsApp group chats and generate a health report.
+
+    Connects to the local SQLite database and inspects all group chats
+    (@g.us JIDs). Each group is classified based on message volume and
+    user participation rate, and recommendations are generated for which
+    groups to add to the chat filter.
+
+    Args:
+        days_inactive: Days since last message to consider a group inactive (default 30)
+        offender_threshold: Message count threshold for offender classification (default 1000)
+        participation_threshold: Minimum user participation ratio 0.0-1.0 (default 0.05 = 5%)
+
+    Returns:
+        dict with keys:
+            summary: total groups, total messages, total currently filtered
+            currently_filtered: list of JIDs currently in ignore-chats.json
+            groups: list of all groups sorted by message count desc, each with
+                    jid, name, message_count, media_count, last_activity,
+                    user_messages, participation_pct, category, recommended_action
+            recommendations: groups recommended to add to the filter
+    """
+    import time as _time
+
+    # Read currently filtered JIDs from ignore-chats.json (if present)
+    ignore_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "whatsapp-bridge",
+        "store",
+        "ignore-chats.json",
+    )
+    currently_filtered: list[str] = []
+    try:
+        with open(ignore_path, encoding="utf-8") as fh:
+            filter_data = json.load(fh)
+            currently_filtered = filter_data.get("ignore_chats", [])
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"Warning: could not read ignore-chats.json: {exc}")
+
+    now_ts = _time.time()
+    inactive_cutoff_ts = now_ts - (days_inactive * 86400)
+
+    conn = sqlite3.connect(MESSAGES_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # Pull per-group stats in a single query for efficiency.
+    # last_activity is stored as an ISO timestamp string in SQLite.
+    cur.execute(
+        """
+        SELECT
+            c.jid,
+            c.name,
+            COUNT(m.id)                          AS message_count,
+            SUM(CASE WHEN m.media_type != '' AND m.media_type IS NOT NULL
+                     THEN 1 ELSE 0 END)          AS media_count,
+            MAX(m.timestamp)                      AS last_activity_raw,
+            SUM(CASE WHEN m.is_from_me = 1
+                     THEN 1 ELSE 0 END)          AS user_messages
+        FROM chats c
+        LEFT JOIN messages m ON m.chat_jid = c.jid
+        WHERE c.jid LIKE '%@g.us'
+        GROUP BY c.jid, c.name
+        ORDER BY message_count DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    groups = []
+    total_messages = 0
+    recommendations = []
+
+    for row in rows:
+        jid = row["jid"]
+        name = row["name"] or jid
+        message_count = row["message_count"] or 0
+        media_count = row["media_count"] or 0
+        user_messages = row["user_messages"] or 0
+        last_activity_raw = row["last_activity_raw"]
+
+        total_messages += message_count
+
+        # Parse last_activity timestamp (SQLite stores as ISO string or unix int)
+        last_activity_ts: float | None = None
+        last_activity_str = ""
+        if last_activity_raw is not None:
+            try:
+                # Try as numeric unix timestamp first
+                last_activity_ts = float(last_activity_raw)
+                last_activity_str = datetime.fromtimestamp(last_activity_ts).isoformat()
+            except (ValueError, TypeError):
+                try:
+                    dt = datetime.fromisoformat(str(last_activity_raw))
+                    last_activity_ts = dt.timestamp()
+                    last_activity_str = dt.isoformat()
+                except ValueError:
+                    last_activity_str = str(last_activity_raw)
+
+        participation_pct = 0.0
+        if message_count > 0:
+            participation_pct = round((user_messages / message_count) * 100, 1)
+
+        # Classify the group
+        is_inactive = (
+            last_activity_ts is not None and last_activity_ts < inactive_cutoff_ts
+        ) or last_activity_ts is None
+
+        participation_ratio = participation_pct / 100.0
+
+        if message_count >= offender_threshold and participation_ratio < participation_threshold:
+            category = "offender"
+            recommended_action = "filter"
+        elif is_inactive:
+            category = "inactive"
+            recommended_action = "review"
+        elif message_count >= 500 and participation_ratio < (participation_threshold * 2):
+            category = "low_value"
+            recommended_action = "consider filtering"
+        else:
+            category = "active"
+            recommended_action = "keep"
+
+        group_entry = {
+            "jid": jid,
+            "name": name,
+            "message_count": message_count,
+            "media_count": media_count,
+            "last_activity": last_activity_str,
+            "user_messages": user_messages,
+            "participation_pct": participation_pct,
+            "category": category,
+            "recommended_action": recommended_action,
+            "currently_filtered": jid in currently_filtered,
+        }
+        groups.append(group_entry)
+
+        if category in ("offender", "low_value") and jid not in currently_filtered:
+            recommendations.append(group_entry)
+
+    return {
+        "summary": {
+            "total_groups": len(groups),
+            "total_messages": total_messages,
+            "total_filtered": len(currently_filtered),
+        },
+        "currently_filtered": currently_filtered,
+        "groups": groups,
+        "recommendations": recommendations,
+    }

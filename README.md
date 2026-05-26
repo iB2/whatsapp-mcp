@@ -273,6 +273,90 @@ Get messages around a specific message for context.
 - `before` (optional): Number of messages before (default 5)
 - `after` (optional): Number of messages after (default 5)
 
+
+## Chat Filter
+
+The chat filter lets you exclude noisy group chats from being stored in the bridge database. Messages from ignored chats are dropped at the Go bridge level — before hitting SQLite — keeping your database lean without affecting the chats you actually care about.
+
+### Setup
+
+1. Copy the example config to the store directory:
+
+   ```bash
+   cp whatsapp-bridge/ignore-chats.example.json whatsapp-bridge/store/ignore-chats.json
+   ```
+
+2. Edit `whatsapp-bridge/store/ignore-chats.json` and replace the example JIDs with the groups you want to ignore:
+
+   ```json
+   {
+     "ignore_chats": [
+       "120363012345678901@g.us",
+       "120363098765432101@g.us"
+     ],
+     "_comments": {
+       "120363012345678901@g.us": "Family announcements (read-only noise)",
+       "120363098765432101@g.us": "Company all-hands broadcast"
+     }
+   }
+   ```
+
+3. The filter **hot-reloads** — edits take effect within seconds without restarting the bridge.
+
+### Finding Group JIDs
+
+Use the `list_chats` MCP tool to browse your chats and identify JIDs. Group JIDs always end in `@g.us`. You can also run the `analyze_chats` tool (see below) for a bulk view.
+
+### Cleanup Script
+
+After adding groups to the filter, you may want to delete their historical messages from SQLite. The `cleanup-ignored-chats.py` script does this safely.
+
+> **Stop the bridge first** — it holds a lock on the database.
+
+```bash
+# Dry run (shows what would be deleted, no changes)
+python cleanup-ignored-chats.py
+
+# Apply deletions
+python cleanup-ignored-chats.py --apply
+```
+
+The script deletes all messages, chat rows, call rows, and downloaded media files for each ignored JID, then runs `VACUUM` to reclaim disk space.
+
+## Chat Analytics
+
+The `analyze_chats` MCP tool generates a health report of all your WhatsApp group chats. It connects directly to the local SQLite database and classifies each group based on message volume and your participation rate.
+
+### Usage
+
+Ask Claude to run the tool:
+
+> "Analyze my WhatsApp group chats and tell me which ones I should filter."
+
+Or call it directly with custom thresholds:
+
+```
+analyze_chats(days_inactive=60, offender_threshold=500, participation_threshold=3.0)
+```
+
+### Classification
+
+| Category | Criteria | Recommended Action |
+|----------|----------|--------------------|
+| `offender` | >1000 messages AND <5% participation | Filter |
+| `inactive` | No messages in last 30 days | Review |
+| `low_value` | >500 messages AND <10% participation | Consider filtering |
+| `active` | Everything else | Keep |
+
+### Report Structure
+
+The tool returns:
+
+- **summary**: total groups, total messages, how many are currently filtered
+- **currently_filtered**: JIDs already in `ignore-chats.json`
+- **groups**: all groups sorted by message count, with category and participation %
+- **recommendations**: groups suggested for filtering (offenders + low_value not yet filtered)
+
 ## Configuration
 
 Copy `.env.example` to `.env` and configure as needed:
