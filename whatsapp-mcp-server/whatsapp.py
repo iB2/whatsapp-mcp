@@ -999,6 +999,57 @@ def send_message(recipient: str, message: str) -> tuple[bool, str]:
         return False, f"Unexpected error: {str(e)}"
 
 
+def send_poll(
+    recipient: str,
+    question: str,
+    options: list[str],
+    allow_multiple: bool = False,
+) -> tuple[bool, str]:
+    """Send a native WhatsApp poll via the bridge.
+
+    Polls are a native protocol message, so unlike buttons/list messages they
+    are safe to send from a personal account.
+    """
+    try:
+        # Validate input
+        if not recipient:
+            return False, "Recipient must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/poll"
+        payload = {
+            "recipient": recipient,
+            "question": question,
+            "options": options,
+            "allow_multiple": allow_multiple,
+        }
+
+        response = requests.post(url, json=payload, headers=_bridge_headers())
+
+        # Check if the request was successful
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+
+        # The bridge answers 400 with a JSON body naming the rule that failed
+        # (option count, duplicate option, length limits). Surface that text
+        # instead of a bare status code, so the caller can fix the poll.
+        try:
+            result = response.json()
+            if isinstance(result, dict) and result.get("message"):
+                return False, result["message"]
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
 def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
     try:
         # Validate input

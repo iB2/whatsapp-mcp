@@ -5,6 +5,9 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from whatsapp import (
+    analyze_chats as whatsapp_analyze_chats,
+)
+from whatsapp import (
     download_media as whatsapp_download_media,
 )
 from whatsapp import (
@@ -43,9 +46,8 @@ from whatsapp import (
 from whatsapp import (
     send_message as whatsapp_send_message,
 )
-
 from whatsapp import (
-    analyze_chats as whatsapp_analyze_chats,
+    send_poll as whatsapp_send_poll,
 )
 
 # Initialize FastMCP server
@@ -313,6 +315,38 @@ def send_message(recipient: str, message: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def send_poll(
+    recipient: str,
+    question: str,
+    options: list[str],
+    allow_multiple: bool = False,
+) -> dict[str, Any]:
+    """Send a native WhatsApp poll to a person or group. For group chats use the JID.
+
+    Polls are the safe way to ask for a structured answer: they are a native
+    WhatsApp protocol message. Votes arrive encrypted and are decoded by the
+    bridge, which records them in the message history as
+    "[poll-vote] <question> -> <option>".
+
+    Args:
+        recipient: The recipient - either a phone number with country code but no + or other symbols,
+                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        question: The poll question (max 255 characters)
+        options: Between 2 and 12 answer options, max 100 characters each, no duplicates
+        allow_multiple: If True, voters may select more than one option (default: single choice)
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    # Validate input
+    if not recipient:
+        return {"success": False, "message": "Recipient must be provided"}
+
+    success, status_message = whatsapp_send_poll(recipient, question, options, allow_multiple)
+    return {"success": success, "message": status_message}
+
+
+@mcp.tool()
 def send_file(recipient: str, media_path: str) -> dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
 
@@ -365,8 +399,6 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
         return {"success": False, "message": "Failed to download media"}
 
 
-
-
 @mcp.tool()
 def analyze_chats(
     days_inactive: int = 30,
@@ -391,6 +423,7 @@ def analyze_chats(
         offender_threshold=offender_threshold,
         participation_threshold=participation_threshold / 100.0,
     )
+
 
 def shutdown_handler(signum, frame):
     """Handle shutdown signals gracefully to prevent zombie processes."""
