@@ -1195,8 +1195,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
-				FileName:      proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				// outboundFileName, not a manual split: the document filename
+				// is published to the recipient, and the old "/"-only split
+				// sent the whole absolute path on Windows.
+				Title:         proto.String(outboundFileName(mediaPath)),
+				FileName:      proto.String(outboundFileName(mediaPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -1823,10 +1826,16 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// KEEP the query string. whatsmeow builds the download URL as
+	// "https://<host>" + directPath + "&hash=...&mms-type=...", i.e. it assumes
+	// directPath already carries "?ccb=..&oh=..&oe=..&_nc_sid=..", exactly like
+	// the directPath field of a real protobuf message. Stripping the query drops
+	// the oh/oe signature and produces a malformed URL — the CDN answers 403.
+	//
+	// This only started mattering after the 2026-08-04 whatsmeow bump: the older
+	// Download() honoured GetURL() (the full signed URL) and never touched
+	// directPath. The current one ignores GetURL() entirely and always goes
+	// through DownloadMediaWithPath.
 	return "/" + pathPart
 }
 
