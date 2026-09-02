@@ -108,6 +108,25 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+		CREATE TABLE polls (
+			id TEXT,
+			chat_jid TEXT,
+			question TEXT,
+			options TEXT,
+			selectable_count INTEGER,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			PRIMARY KEY (id, chat_jid)
+		);
+		CREATE TABLE poll_votes (
+			id TEXT,
+			poll_id TEXT,
+			chat_jid TEXT,
+			voter TEXT,
+			selected_options TEXT,
+			timestamp TIMESTAMP,
+			PRIMARY KEY (id, chat_jid)
+		);
 		CREATE TABLE calls (
 			call_id TEXT,
 			chat_jid TEXT,

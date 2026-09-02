@@ -195,6 +195,29 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (call_id, chat_jid)
 		);
 
+		CREATE TABLE IF NOT EXISTS polls (
+			id TEXT,
+			chat_jid TEXT,
+			question TEXT,
+			options TEXT,
+			selectable_count INTEGER,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			PRIMARY KEY (id, chat_jid)
+		);
+
+		CREATE TABLE IF NOT EXISTS poll_votes (
+			id TEXT,
+			poll_id TEXT,
+			chat_jid TEXT,
+			voter TEXT,
+			selected_options TEXT,
+			timestamp TIMESTAMP,
+			PRIMARY KEY (id, chat_jid)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes(poll_id, chat_jid);
+
 		CREATE INDEX IF NOT EXISTS idx_calls_chat ON calls(chat_jid);
 		CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON calls(timestamp);
 	`)
@@ -863,6 +886,12 @@ func extractTextContent(msg *waProto.Message) string {
 		return doc.GetCaption()
 	}
 
+	// Polls carry no text field, so without this they would be stored as an
+	// empty row (or dropped by StoreMessage's empty-content guard).
+	if poll := msg.GetPollCreationMessage(); poll != nil {
+		return formatPollContent(poll.GetName(), pollOptionNames(poll))
+	}
+
 	return ""
 }
 
@@ -943,6 +972,8 @@ func applyChatEphemeralSettings(msg *waProto.Message, settings ChatEphemeralSett
 		msg.VideoMessage.ContextInfo = mergeEphemeralContextInfo(msg.VideoMessage.GetContextInfo(), settings)
 	case msg.DocumentMessage != nil:
 		msg.DocumentMessage.ContextInfo = mergeEphemeralContextInfo(msg.DocumentMessage.GetContextInfo(), settings)
+	case msg.PollCreationMessage != nil:
+		msg.PollCreationMessage.ContextInfo = mergeEphemeralContextInfo(msg.PollCreationMessage.GetContextInfo(), settings)
 	case msg.Conversation != nil:
 		text := msg.GetConversation()
 		msg.Conversation = nil
@@ -1500,6 +1531,17 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
+	// Poll votes arrive as PollUpdateMessage: no text content, payload
+	// encrypted, and meaningless to the regular message path. Handle (and
+	// stop) here, before the "no content" early return below drops them.
+	if handlePollUpdate(client, messageStore, msg, chatJID, sender, logger) {
+		return
+	}
+
+	// Record the option list of any poll we observe, so its votes can later
+	// be resolved from hashes back to text.
+	handlePollCreation(messageStore, msg, chatJID, logger)
+
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
@@ -1933,6 +1975,52 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		}
 
 		// Send response
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: success,
+			Message: message,
+		})
+	}))
+
+	// Handler for sending native polls.
+	//
+	// Polls are deliberately the only interactive message type exposed:
+	// buttons and list messages are Business-API surfaces and emitting them
+	// from a personal account risks a ban.
+	mux.HandleFunc("/api/poll", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		fmt.Printf("→ /api/poll from=%q user_agent=%q\n", r.RemoteAddr, r.UserAgent())
+
+		var req SendPollRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if err := validatePollRequest(req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: err.Error(),
+			})
+			return
+		}
+
+		// Question and option text are user content; log shape, not payload.
+		fmt.Printf("→ /api/poll recipient=%q options=%d selectable=%d\n",
+			req.Recipient, len(req.Options), req.selectableCount())
+
+		success, message := sendWhatsAppPoll(client, messageStore, req)
+		fmt.Printf("← /api/poll success=%v status=%q\n", success, message)
+
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
 			Message: message,
