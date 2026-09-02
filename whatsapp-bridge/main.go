@@ -142,6 +142,25 @@ func NewMessageStore() (*MessageStore, error) {
 
 		CREATE INDEX IF NOT EXISTS idx_calls_chat ON calls(chat_jid);
 		CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON calls(timestamp);
+
+		-- One row per (chat, reacted-to message, reactor): current state, not
+		-- history. An empty emoji means the reaction was taken back. See
+		-- reactions.go for why these do not live in the messages table.
+		CREATE TABLE IF NOT EXISTS reactions (
+			id TEXT,
+			chat_jid TEXT,
+			target_id TEXT,
+			target_from_me BOOLEAN,
+			sender TEXT,
+			emoji TEXT,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			PRIMARY KEY (chat_jid, target_id, sender),
+			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_reactions_target ON reactions(target_id);
+		CREATE INDEX IF NOT EXISTS idx_reactions_timestamp ON reactions(timestamp);
 	`)
 	if err != nil {
 		_ = db.Close()
@@ -1435,6 +1454,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		if err := messageStore.UpdateChatEphemeralSettings(chatJID, backfill.Expiration, backfill.SettingTimestamp); err != nil {
 			logger.Warnf("Failed to backfill ephemeral settings for %s: %v", chatJID, err)
 		}
+	}
+
+	// Reactions carry neither text nor media, so without this branch they fall
+	// through to the "no content" guard below and disappear. They are stored in
+	// their own table, never as chat content.
+	if handleReaction(messageStore, msg, chatJID, sender, logger) {
+		return
 	}
 
 	// Extract text content

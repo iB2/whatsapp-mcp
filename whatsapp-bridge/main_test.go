@@ -122,6 +122,18 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			reason TEXT,
 			PRIMARY KEY (call_id, chat_jid)
 		);
+		CREATE TABLE reactions (
+			id TEXT,
+			chat_jid TEXT,
+			target_id TEXT,
+			target_from_me BOOLEAN,
+			sender TEXT,
+			emoji TEXT,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			PRIMARY KEY (chat_jid, target_id, sender),
+			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
 	`)
 	if err != nil {
 		t.Fatalf("failed to create tables: %v", err)
