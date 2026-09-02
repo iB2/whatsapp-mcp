@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -17,6 +18,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,7 +26,6 @@ import (
 	"github.com/mdp/qrterminal"
 
 	"bytes"
-	"sync"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -49,6 +50,8 @@ var fullHistoryPairFlag = flag.Bool("full-history-pair", false,
 
 var chatFilter *ChatFilter
 
+const whatsmeowDBPath = "store/whatsapp.db"
+
 // getEnvBool reads a boolean env var with a default.
 // Accepts: 1/true/yes/on and 0/false/no/off (case-insensitive)
 func getEnvBool(key string, def bool) bool {
@@ -69,10 +72,10 @@ func getEnvBool(key string, def bool) bool {
 // ChatFilter manages a set of chat JIDs to ignore. It loads from a JSON file
 // on disk and hot-reloads when the file changes (checked on each call).
 type ChatFilter struct {
-	mu       sync.RWMutex
-	ignored  map[string]bool
-	path     string
-	modTime  time.Time
+	mu      sync.RWMutex
+	ignored map[string]bool
+	path    string
+	modTime time.Time
 }
 
 type chatFilterFile struct {
@@ -118,6 +121,13 @@ func (cf *ChatFilter) IsIgnored(chatJID string) bool {
 	return cf.ignored[chatJID]
 }
 
+// resolveDeviceName returns the operator-configured linked-device label from
+// WHATSAPP_DEVICE_NAME, trimmed of surrounding whitespace. An empty or unset
+// value returns "", which callers treat as "keep the whatsmeow default".
+func resolveDeviceName() string {
+	return strings.TrimSpace(os.Getenv("WHATSAPP_DEVICE_NAME"))
+}
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -130,7 +140,8 @@ type Message struct {
 
 // Database handler for storing message history
 type MessageStore struct {
-	db *sql.DB
+	db   *sql.DB
+	waDB *sql.DB // whatsmeow's DB for contact name resolution fallback
 }
 
 type ChatEphemeralSettings struct {
@@ -220,18 +231,48 @@ func NewMessageStore() (*MessageStore, error) {
 
 		CREATE INDEX IF NOT EXISTS idx_calls_chat ON calls(chat_jid);
 		CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON calls(timestamp);
+		CREATE INDEX IF NOT EXISTS idx_messages_chat_jid ON messages(chat_jid);
 	`)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Open whatsmeow's database read-only for contact name resolution fallback.
+	// Missing DBs are expected on first run and should not create a new file.
+	waDB, err := openWhatsmeowContactsDB(whatsmeowDBPath)
+	if err != nil {
+		fmt.Printf("Warning: could not open whatsmeow database for contact resolution: %v\n", err)
+	}
+
 	if err := ensureMessageStoreSchema(db); err != nil {
 		_ = db.Close()
+		if waDB != nil {
+			_ = waDB.Close()
+		}
 		return nil, err
 	}
 
-	return &MessageStore{db: db}, nil
+	return &MessageStore{db: db, waDB: waDB}, nil
+}
+
+func openWhatsmeowContactsDB(path string) (*sql.DB, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?mode=ro", path))
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 func ensureMessageStoreSchema(db *sql.DB) error {
@@ -241,8 +282,14 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 	if err := ensureColumn(db, "chats", "ephemeral_setting_timestamp", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("failed to ensure chats.ephemeral_setting_timestamp column: %w", err)
 	}
+	if err := ensureColumn(db, "chats", "last_read_time", "TIMESTAMP"); err != nil {
+		return fmt.Errorf("failed to ensure chats.last_read_time column: %w", err)
+	}
 	if err := ensureColumn(db, "messages", "deleted_at", "TIMESTAMP"); err != nil {
 		return fmt.Errorf("failed to ensure messages.deleted_at column: %w", err)
+	}
+	if err := ensureColumn(db, "messages", "quoted_message_id", "TEXT"); err != nil {
+		return fmt.Errorf("failed to ensure messages.quoted_message_id column: %w", err)
 	}
 	return nil
 }
@@ -369,7 +416,8 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 					FROM messages msg
 					WHERE msg.chat_jid = m.lid_jid
 				)
-			) AS source_last_message_time
+			) AS source_last_message_time,
+			c.last_read_time AS source_last_read_time
 		FROM tmp_lid_to_phone m
 		LEFT JOIN chats c ON c.jid = m.lid_jid;
 	`); err != nil {
@@ -394,7 +442,8 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 				),
 				substr(c.phone_jid, 1, instr(c.phone_jid, '@') - 1)
 			) AS source_name,
-			MAX(c.source_last_message_time) AS source_last_message_time
+			MAX(c.source_last_message_time) AS source_last_message_time,
+			MAX(c.source_last_read_time) AS source_last_read_time
 		FROM tmp_lid_chat_candidates c
 		GROUP BY c.phone_jid;
 	`); err != nil {
@@ -402,8 +451,8 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 	}
 
 	if _, err := tx.Exec(`
-		INSERT OR IGNORE INTO chats (jid, name, last_message_time)
-		SELECT phone_jid, source_name, source_last_message_time
+		INSERT OR IGNORE INTO chats (jid, name, last_message_time, last_read_time)
+		SELECT phone_jid, source_name, source_last_message_time, source_last_read_time
 		FROM tmp_lid_chat_meta;
 	`); err != nil {
 		return fmt.Errorf("failed to upsert destination chat rows: %w", err)
@@ -441,6 +490,28 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 					WHERE m.phone_jid = chats.jid
 				)
 				ELSE last_message_time
+			END,
+			last_read_time = CASE
+				WHEN (
+					SELECT m.source_last_read_time
+					FROM tmp_lid_chat_meta m
+					WHERE m.phone_jid = chats.jid
+				) IS NULL THEN last_read_time
+				WHEN last_read_time IS NULL THEN (
+					SELECT m.source_last_read_time
+					FROM tmp_lid_chat_meta m
+					WHERE m.phone_jid = chats.jid
+				)
+				WHEN (
+					SELECT m.source_last_read_time
+					FROM tmp_lid_chat_meta m
+					WHERE m.phone_jid = chats.jid
+				) > last_read_time THEN (
+					SELECT m.source_last_read_time
+					FROM tmp_lid_chat_meta m
+					WHERE m.phone_jid = chats.jid
+				)
+				ELSE last_read_time
 			END
 		WHERE jid IN (SELECT phone_jid FROM tmp_lid_chat_meta);
 	`); err != nil {
@@ -620,9 +691,16 @@ func (store *MessageStore) MigrateLegacyLIDSendersToPhones(whatsappDBPath string
 	return nil
 }
 
-// Close the database connection
+// Close the database connections
 func (store *MessageStore) Close() error {
-	return store.db.Close()
+	var waErr error
+	if store.waDB != nil {
+		waErr = store.waDB.Close()
+	}
+	if err := store.db.Close(); err != nil {
+		return err
+	}
+	return waErr
 }
 
 // Store a chat in the database. An empty `name` preserves any existing
@@ -678,6 +756,27 @@ func (store *MessageStore) UpdateChatEphemeralSettings(jid string, expiration ui
 	return err
 }
 
+// MarkChatRead records that we read the chat up to readAt. The marker merges
+// monotonically — out-of-order receipts and history-sync backfill can never
+// move it backwards and un-read a chat. Like UpdateChatEphemeralSettings it
+// inserts only its own column, leaving name/last_message_time NULL so a receipt
+// arriving before any StoreChat call doesn't fabricate placeholder metadata.
+func (store *MessageStore) MarkChatRead(jid string, readAt time.Time) error {
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, last_read_time)
+		VALUES (?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			last_read_time = CASE
+				WHEN chats.last_read_time IS NULL THEN excluded.last_read_time
+				WHEN excluded.last_read_time IS NULL THEN chats.last_read_time
+				WHEN excluded.last_read_time > chats.last_read_time THEN excluded.last_read_time
+				ELSE chats.last_read_time
+			END`,
+		jid, readAt,
+	)
+	return err
+}
+
 func (store *MessageStore) GetChatEphemeralSettings(jid string) (ChatEphemeralSettings, error) {
 	var settings ChatEphemeralSettings
 	err := store.db.QueryRow(
@@ -690,18 +789,125 @@ func (store *MessageStore) GetChatEphemeralSettings(jid string) (ChatEphemeralSe
 	return settings, nil
 }
 
+// GetMessageIsFromMe resolves the origin of a stored message for a quoted
+// reply. The boolean pointer distinguishes a known false value from a quote
+// that is absent from the local store.
+func (store *MessageStore) GetMessageIsFromMe(id, chatJID string) (*bool, error) {
+	var isFromMe bool
+	err := store.db.QueryRow(
+		"SELECT is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
+		id, chatJID,
+	).Scan(&isFromMe)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &isFromMe, nil
+}
+
+// bareSenderUser normalizes a phone/LID or full JID to the bare user part
+// stored in messages.sender.
+func bareSenderUser(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '@'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// ValidateInboundMarkRead checks that every message ID exists in chatJID, is
+// inbound, and belongs to the expected sender before we send a read receipt.
+// senderHint may be bare or a full JID; when empty (DM), the chat user is used.
+func (store *MessageStore) ValidateInboundMarkRead(chatJID, senderHint string, ids []string) error {
+	expected := bareSenderUser(senderHint)
+	if expected == "" {
+		if jid, err := types.ParseJID(chatJID); err == nil {
+			expected = jid.User
+		}
+	}
+	if expected == "" {
+		return fmt.Errorf("could not determine expected sender for chat %q", chatJID)
+	}
+
+	for _, id := range ids {
+		var sender string
+		var isFromMe bool
+		err := store.db.QueryRow(
+			`SELECT sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?`,
+			id, chatJID,
+		).Scan(&sender, &isFromMe)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("message %q not found in chat %q", id, chatJID)
+		}
+		if err != nil {
+			return err
+		}
+		if isFromMe {
+			return fmt.Errorf("message %q is outbound; only inbound messages can be marked read", id)
+		}
+		if bareSenderUser(sender) != expected {
+			return fmt.Errorf("message %q sender %q does not match %q", id, sender, expected)
+		}
+	}
+	return nil
+}
+
+// MaxMessageTimestamp returns the latest stored timestamp among the given
+// message IDs in chatJID. ok is false when none of the IDs are present.
+func (store *MessageStore) MaxMessageTimestamp(chatJID string, ids []string) (time.Time, bool, error) {
+	if len(ids) == 0 {
+		return time.Time{}, false, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, 1+len(ids))
+	args = append(args, chatJID)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	var raw any
+	err := store.db.QueryRow(
+		`SELECT MAX(timestamp) FROM messages WHERE chat_jid = ? AND id IN (`+strings.Join(placeholders, ",")+`)`,
+		args...,
+	).Scan(&raw)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if raw == nil {
+		return time.Time{}, false, nil
+	}
+	ts := anchorTime(raw)
+	if ts.IsZero() {
+		return time.Time{}, false, fmt.Errorf("unparseable message timestamp %v", raw)
+	}
+	return ts, true, nil
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedMessageId string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
+	// Store empty quoted_message_id as SQL NULL so the column is null for
+	// plain messages (no ContextInfo). This makes the ON CONFLICT merge
+	// straightforward: COALESCE prefers the new non-null value over a
+	// kept null, and ignores an incoming null so it cannot clobber a
+	// previously-stored ID.
+	var qmid interface{}
+	if quotedMessageId != "" {
+		qmid = quotedMessageId
+	}
+
 	_, err := store.db.Exec(
 		`INSERT INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
 			sender = excluded.sender,
 			content = excluded.content,
@@ -713,8 +919,9 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 			media_key = excluded.media_key,
 			file_sha256 = excluded.file_sha256,
 			file_enc_sha256 = excluded.file_enc_sha256,
-			file_length = excluded.file_length`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+			file_length = excluded.file_length,
+			quoted_message_id = COALESCE(excluded.quoted_message_id, messages.quoted_message_id)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, qmid,
 	)
 	return err
 }
@@ -886,6 +1093,48 @@ func extractTextContent(msg *waProto.Message) string {
 		return doc.GetCaption()
 	}
 
+	// WhatsApp Business templates arrive hydrated — body lives in
+	// HydratedTemplate.HydratedContentText. Without this branch every
+	// template-sent message (e.g. WABA Connect Hrms_* notifications)
+	// returns "" and the row is silently skipped at the storage gate.
+	if tpl := msg.GetTemplateMessage(); tpl != nil {
+		if h := tpl.GetHydratedTemplate(); h != nil {
+			if t := h.GetHydratedContentText(); t != "" {
+				return t
+			}
+		}
+	}
+	if btn := msg.GetButtonsMessage(); btn != nil {
+		if t := btn.GetContentText(); t != "" {
+			return t
+		}
+		if t := btn.GetText(); t != "" {
+			return t
+		}
+	}
+	if ia := msg.GetInteractiveMessage(); ia != nil {
+		if body := ia.GetBody(); body != nil {
+			if t := body.GetText(); t != "" {
+				return t
+			}
+		}
+	}
+	if lst := msg.GetListMessage(); lst != nil {
+		if t := lst.GetDescription(); t != "" {
+			return t
+		}
+	}
+	if br := msg.GetButtonsResponseMessage(); br != nil {
+		if t := br.GetSelectedDisplayText(); t != "" {
+			return t
+		}
+	}
+	if tbr := msg.GetTemplateButtonReplyMessage(); tbr != nil {
+		if t := tbr.GetSelectedDisplayText(); t != "" {
+			return t
+		}
+	}
+
 	// Polls carry no text field, so without this they would be stored as an
 	// empty row (or dropped by StoreMessage's empty-content guard).
 	if poll := msg.GetPollCreationMessage(); poll != nil {
@@ -903,9 +1152,33 @@ type SendMessageResponse struct {
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient       string `json:"recipient"`
+	Message         string `json:"message"`
+	MediaPath       string `json:"media_path,omitempty"`
+	QuotedMessageID string `json:"quoted_message_id,omitempty"`
+	QuotedSenderJID string `json:"quoted_sender_jid,omitempty"`
+	QuotedContent   string `json:"quoted_content,omitempty"`
+	// Mentions lists users to @-mention (phone numbers or JIDs). The message
+	// text must contain a matching "@<number>" token for each entry, or the
+	// mention won't render on recipients' devices.
+	Mentions []string `json:"mentions,omitempty"`
+}
+
+// MarkReadRequest is the request body for the /api/mark-read endpoint.
+type MarkReadRequest struct {
+	MessageIDs []string `json:"message_ids"`
+	ChatJID    string   `json:"chat_jid"`
+	SenderJID  string   `json:"sender_jid,omitempty"`
+	Timestamp  string   `json:"timestamp,omitempty"`
+}
+
+// ReactRequest is the request body for the /api/react endpoint.
+type ReactRequest struct {
+	Recipient string  `json:"recipient"`  // chat JID
+	MessageID string  `json:"message_id"` // ID of the message being reacted to
+	FromMe    bool    `json:"from_me"`    // whether the reacted-to message was sent by us
+	SenderJID string  `json:"sender_jid"` // full JID of the reacted-to message's sender
+	Emoji     *string `json:"emoji"`      // reaction emoji; empty string removes the reaction
 }
 
 // classifyMediaPath maps a file extension to (whatsmeow upload type, MIME
@@ -1118,11 +1391,41 @@ func resolveRecipientJID(client *whatsmeow.Client, recipient string) (types.JID,
 	return recipientJID, nil
 }
 
+// resolveMentionJIDs maps mention entries (phone numbers or JIDs) to the JID
+// strings WhatsApp expects in ContextInfo.MentionedJID. Phone-number entries
+// contribute both the phone JID and, when known, its LID form so the mention
+// renders regardless of the group's addressing mode.
+func resolveMentionJIDs(client *whatsmeow.Client, mentions []string) []string {
+	var resolved []string
+	for _, mention := range mentions {
+		var jid types.JID
+		if strings.Contains(mention, "@") {
+			parsed, err := types.ParseJID(mention)
+			if err != nil {
+				fmt.Printf("Warning: skipping unparseable mention %q: %v\n", mention, err)
+				continue
+			}
+			jid = parsed
+		} else {
+			jid = types.JID{User: mention, Server: types.DefaultUserServer}
+		}
+		resolved = append(resolved, jid.String())
+		if jid.Server == types.DefaultUserServer {
+			if lid, err := client.Store.LIDs.GetLIDForPN(context.Background(), jid); err == nil && !lid.IsEmpty() {
+				resolved = append(resolved, lid.String())
+			}
+		}
+	}
+	return resolved
+}
+
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMsgID string, quotedSenderJID string, quotedContent string, mentions []string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
+
+	mentionedJIDs := resolveMentionJIDs(client, mentions)
 
 	var settingsLookupJID types.JID
 	var err error
@@ -1241,8 +1544,37 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileLength:    &resp.FileLength,
 			}
 		}
+	} else if quotedMsgID != "" || len(mentionedJIDs) > 0 {
+		// Quoted reply and/or mentions: use ExtendedTextMessage so we can
+		// attach ContextInfo. Only text quoting is supported; quoting media
+		// messages is not exposed because the quoted preview on the
+		// recipient's device requires the original media's key/URL, which is
+		// not available to the API caller.
+		ctx := &waProto.ContextInfo{}
+		if quotedMsgID != "" {
+			ctx.StanzaID = proto.String(quotedMsgID)
+			ctx.Participant = proto.String(quotedSenderJID)
+			ctx.QuotedMessage = &waProto.Message{Conversation: proto.String(quotedContent)}
+		}
+		ctx.MentionedJID = mentionedJIDs
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+			Text:        proto.String(message),
+			ContextInfo: ctx,
+		}
 	} else {
 		msg.Conversation = proto.String(message)
+	}
+
+	// Mentions in media captions live on the media message's own ContextInfo.
+	if len(mentionedJIDs) > 0 {
+		switch {
+		case msg.ImageMessage != nil:
+			msg.ImageMessage.ContextInfo = &waProto.ContextInfo{MentionedJID: mentionedJIDs}
+		case msg.VideoMessage != nil:
+			msg.VideoMessage.ContextInfo = &waProto.ContextInfo{MentionedJID: mentionedJIDs}
+		case msg.DocumentMessage != nil:
+			msg.DocumentMessage.ContextInfo = &waProto.ContextInfo{MentionedJID: mentionedJIDs}
+		}
 	}
 
 	// Normalize @lid recipients to phone JID before the lookup. Chats are
@@ -1305,7 +1637,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 		if storeErr := messageStore.StoreMessage(
 			resp.ID, chatJID, senderUser, message, timestamp, true,
-			mediaType, filename, "", nil, nil, nil, 0,
+			mediaType, filename, "", nil, nil, nil, 0, quotedMsgID,
 		); storeErr != nil {
 			fmt.Printf("Warning: failed to persist outbound message: %v\n", storeErr)
 		}
@@ -1357,6 +1689,32 @@ func extractQuotedMessageInfo(msg *waProto.Message) (quotedMessageId string, quo
 	return quotedMessageId, quotedSender, quotedContent
 }
 
+// extractMentionedJIDs returns native WhatsApp mention targets from ContextInfo.
+func extractMentionedJIDs(msg *waProto.Message) []string {
+	if msg == nil {
+		return nil
+	}
+
+	var contextInfo *waProto.ContextInfo
+	if extText := msg.GetExtendedTextMessage(); extText != nil {
+		contextInfo = extText.GetContextInfo()
+	} else if img := msg.GetImageMessage(); img != nil {
+		contextInfo = img.GetContextInfo()
+	} else if vid := msg.GetVideoMessage(); vid != nil {
+		contextInfo = vid.GetContextInfo()
+	} else if doc := msg.GetDocumentMessage(); doc != nil {
+		contextInfo = doc.GetContextInfo()
+	} else if aud := msg.GetAudioMessage(); aud != nil {
+		contextInfo = aud.GetContextInfo()
+	}
+
+	if contextInfo == nil || len(contextInfo.MentionedJID) == 0 {
+		return nil
+	}
+
+	return append([]string(nil), contextInfo.MentionedJID...)
+}
+
 // Extract media info from a message. Filenames embed the message ID so that
 // two messages arriving in the same second do not collide on a single file.
 func extractMediaInfo(msg *waProto.Message, msgTimestamp time.Time, msgID string) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
@@ -1403,6 +1761,16 @@ func extractMediaInfo(msg *waProto.Message, msgTimestamp time.Time, msgID string
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
 	}
 
+	// Sticker message: WebP image, no caption, same URL+MediaKey+SHA shape as other media.
+	// On the wire stickers surface as type="media" with an <enc mediatype="sticker"> payload, e.g.:
+	//   <message id="..." type="media">
+	//     <enc mediatype="sticker" type="msg" v="2"><!-- 660 bytes --></enc>
+	//   </message>
+	if stk := msg.GetStickerMessage(); stk != nil {
+		return "sticker", "sticker_" + suffix + ".webp",
+			stk.GetURL(), stk.GetMediaKey(), stk.GetFileSHA256(), stk.GetFileEncSHA256(), stk.GetFileLength()
+	}
+
 	return "", "", "", nil, nil, nil, 0
 }
 
@@ -1439,6 +1807,15 @@ func resolveLIDChat(client *whatsmeow.Client, chat, senderAlt, recipientAlt type
 
 	fmt.Printf("Warning: could not resolve LID chat %s to phone JID\n", chat)
 	return chat
+}
+
+// isSelfReadReceipt reports whether a receipt means WE read the chat (on this
+// or another device), as opposed to another user reading our outgoing message.
+// A DM self-read arrives as read-self; a group self-read arrives as a plain
+// read whose participant is us (IsFromMe). See types.ReceiptType docs.
+func isSelfReadReceipt(receipt *events.Receipt) bool {
+	return receipt.Type == types.ReceiptTypeReadSelf ||
+		(receipt.Type == types.ReceiptTypeRead && receipt.IsFromMe)
 }
 
 // resolveUserJID resolves a single user JID (sender or participant) to its
@@ -1481,6 +1858,52 @@ func senderAltForMessage(client *whatsmeow.Client, info types.MessageInfo) types
 }
 
 // Handle regular incoming messages with media support
+// origMsgTime remembers the true send-time of messages that first arrived
+// undecryptable (e.g. after an offline gap, when our session lacked the sender
+// key). WhatsApp re-sends such messages after a retry receipt, but the re-sent
+// copy carries a fresh `t` (the resend time) rather than the original send time.
+// The first (undecryptable) delivery *does* carry the original `t`, so we cache
+// it here and reuse it when the decrypted retry finally lands — otherwise those
+// messages get stored with reconnect-time and corrupt recency ordering.
+var (
+	origMsgTimeMu sync.Mutex
+	origMsgTime   = make(map[string]time.Time)
+)
+
+// rememberOriginalTimestamp records the earliest timestamp seen for a message ID.
+// A resend's `t` is always >= the original, so the earliest is the true one.
+func rememberOriginalTimestamp(id string, ts time.Time) {
+	if id == "" || ts.IsZero() {
+		return
+	}
+	origMsgTimeMu.Lock()
+	defer origMsgTimeMu.Unlock()
+	if existing, ok := origMsgTime[id]; !ok || ts.Before(existing) {
+		origMsgTime[id] = ts
+	}
+	// Soft cap so a burst of never-retried undecryptable messages can't grow this
+	// map unbounded. Entries are normally consumed on successful decrypt.
+	if len(origMsgTime) > 5000 {
+		for k := range origMsgTime {
+			delete(origMsgTime, k)
+			if len(origMsgTime) <= 4000 {
+				break
+			}
+		}
+	}
+}
+
+// takeOriginalTimestamp returns and removes the cached original timestamp for id.
+func takeOriginalTimestamp(id string) (time.Time, bool) {
+	origMsgTimeMu.Lock()
+	defer origMsgTimeMu.Unlock()
+	ts, ok := origMsgTime[id]
+	if ok {
+		delete(origMsgTime, id)
+	}
+	return ts, ok
+}
+
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Resolve LID-based chats to phone-based JIDs so that incoming
 	// and outgoing messages land in the same chat entry.
@@ -1511,8 +1934,18 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
+	// Recover the true send-time if this message first arrived undecryptable and is
+	// now landing via a retry-resend (whose stanza `t` is the resend time, not the
+	// original). See origMsgTime / rememberOriginalTimestamp.
+	msgTimestamp := msg.Info.Timestamp
+	if orig, ok := takeOriginalTimestamp(msg.Info.ID); ok && orig.Before(msgTimestamp) {
+		logger.Infof("Using original pre-retry timestamp for %s: %s (resend `t` was %s)",
+			msg.Info.ID, orig.Format(time.RFC3339), msgTimestamp.Format(time.RFC3339))
+		msgTimestamp = orig
+	}
+
 	// Update chat in database with the message timestamp (keeps last message time updated)
-	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
+	err := messageStore.StoreChat(chatJID, name, msgTimestamp)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
 	}
@@ -1531,6 +1964,33 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
+	// Reactions arrive as their own message stanza rather than message content.
+	// Persist them in the messages table as media_type="reaction", with the
+	// emoji in `content` and the reacted-to message ID in `filename`, then
+	// return — a reaction is not a normal content message. An empty emoji is a
+	// valid event meaning "reaction removed"; we store it (so consumers see the
+	// removal) rather than dropping it.
+	if reaction := msg.Message.GetReactionMessage(); reaction != nil {
+		reactedToID := ""
+		if key := reaction.GetKey(); key != nil {
+			reactedToID = key.GetID()
+		}
+		if reactedToID != "" {
+			emoji := reaction.GetText()
+			if err := messageStore.StoreMessage(
+				msg.Info.ID, chatJID, sender, emoji,
+				msgTimestamp, msg.Info.IsFromMe,
+				"reaction", reactedToID, "", nil, nil, nil, 0, "",
+			); err != nil {
+				logger.Warnf("Failed to store reaction: %v", err)
+			}
+			if forwardSelfMessages || !msg.Info.IsFromMe {
+				SendReactionWebhook(sender, chatJID, msg.Info.IsFromMe, msg.Info.ID, reactedToID, emoji)
+			}
+		}
+		return
+	}
+
 	// Poll votes arrive as PollUpdateMessage: no text content, payload
 	// encrypted, and meaningless to the regular message path. Handle (and
 	// stop) here, before the "no content" early return below drops them.
@@ -1545,11 +2005,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
-	// Extract media info - pass message timestamp + ID for unique filenames
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message, msg.Info.Timestamp, msg.Info.ID)
+	// Extract media info - pass message timestamp + ID for unique filenames.
+	// Must be the same (retry-corrected) timestamp we store below: downloadMedia
+	// rebuilds the on-disk filename from the stored timestamp.
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message, msgTimestamp, msg.Info.ID)
 
 	// Extract quoted message info
 	quotedMessageId, quotedSender, quotedContent := extractQuotedMessageInfo(msg.Message)
+	mentionedJIDs := extractMentionedJIDs(msg.Message)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
@@ -1563,7 +2026,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		chatJID,
 		sender,
 		content,
-		msg.Info.Timestamp,
+		msgTimestamp,
 		msg.Info.IsFromMe,
 		mediaType,
 		filename,
@@ -1572,19 +2035,34 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedMessageId,
 	)
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
 	}
 
-	// For image messages, download media synchronously so we can include the base64
-	// payload in the webhook. Other media types (video, audio, document) are still
-	// downloaded asynchronously since they are not passed to the AI vision pipeline.
+	var quotedIsFromMe *bool
+	if quotedMessageId != "" {
+		var lookupErr error
+		quotedIsFromMe, lookupErr = messageStore.GetMessageIsFromMe(quotedMessageId, chatJID)
+		if lookupErr != nil {
+			logger.Warnf("Failed to resolve quoted message origin: %v", lookupErr)
+		}
+	}
+
+	// Avoid webhook-only image work when no webhook will receive the message. Media
+	// still downloads asynchronously in that case so it remains available to MCP
+	// tools, but message handling never blocks on a disabled outbound webhook.
+	shouldForward := webhooksEnabled() && (forwardSelfMessages || !msg.Info.IsFromMe)
+
+	// For image messages that will be forwarded, download media synchronously so we
+	// can include the base64 payload in the webhook. Other media types (and images
+	// when webhook forwarding is disabled) download asynchronously for caching.
 	var imageDownloadPath string
 	var imageMimeType string
-	if mediaType == "image" && url != "" && len(mediaKey) > 0 {
+	if mediaType == "image" && url != "" && len(mediaKey) > 0 && shouldForward {
 		logger.Infof("Downloading image media for message %s (synchronous)", msg.Info.ID)
-		success, _, _, dlPath, dlErr := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+		success, _, _, dlPath, dlErr := downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
 		if success && dlErr == nil {
 			imageDownloadPath = dlPath
 			// Detect MIME type by sniffing the actual file bytes rather than
@@ -1604,14 +2082,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			logger.Warnf("❌ Image download failed: %v", dlErr)
 			// Fall back to async download so media is cached for future MCP tool calls
 			go func() {
-				_, _, _, _, _ = downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+				_, _, _, _, _ = downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
 			}()
 		}
-	} else if mediaType != "" && mediaType != "image" && url != "" && len(mediaKey) > 0 {
-		// Non-image media: async download for caching only (not sent to vision pipeline)
+	} else if mediaType != "" && url != "" && len(mediaKey) > 0 {
+		// Media that is not included in a webhook payload: async download for caching.
 		logger.Infof("Auto-downloading %s media for message %s", mediaType, msg.Info.ID)
 		go func() {
-			success, _, _, downloadPath, err := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+			success, _, _, downloadPath, err := downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
 			if success && err == nil {
 				logger.Infof("✅ Auto-downloaded media: %s", downloadPath)
 			} else {
@@ -1624,7 +2102,6 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Forward self-messages when FORWARD_SELF=true.
 	// Always forward image messages (even without a text caption) so the AI vision
 	// pipeline can analyse the image content.
-	shouldForward := forwardSelfMessages || !msg.Info.IsFromMe
 	hasText := content != ""
 	hasImage := mediaType == "image"
 
@@ -1632,11 +2109,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		if hasImage {
 			SendWebhookWithMedia(
 				sender, content, chatJID, msg.Info.IsFromMe,
-				quotedMessageId, quotedSender, quotedContent,
+				quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs,
 				msg.Info.ID, mediaType, imageMimeType, filename, imageDownloadPath,
 			)
 		} else {
-			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent)
+			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs)
 		}
 	}
 
@@ -1774,6 +2251,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		ext = ".mp4"
 	case "audio":
 		ext = ".ogg"
+	case "sticker":
+		ext = ".webp"
 	case "document":
 		ext = ""
 	default:
@@ -1826,6 +2305,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		waMediaType = whatsmeow.MediaAudio
 	case "document":
 		waMediaType = whatsmeow.MediaDocument
+	case "sticker":
+		// whatsmeow derives sticker decryption keys from the image HKDF info string
+		// (see download.go: classToMediaType maps "StickerMessage" -> MediaImage).
+		waMediaType = whatsmeow.MediaImage
 	default:
 		return false, "", "", "", fmt.Errorf("unsupported media type: %s", mediaType)
 	}
@@ -1855,6 +2338,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	return true, mediaType, filename, absPath, nil
 }
 
+// downloadMediaForMessage allows message-handling tests to verify whether a
+// download blocks event processing without changing production behavior.
+var downloadMediaForMessage = downloadMedia
+
 // Extract direct path from a WhatsApp media URL
 func extractDirectPathFromURL(url string) string {
 	// The direct path is typically in the URL, we need to extract it
@@ -1866,19 +2353,10 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// KEEP the query string. whatsmeow builds the download URL as
-	// "https://<host>" + directPath + "&hash=...&mms-type=...", i.e. it assumes
-	// directPath already carries "?ccb=..&oh=..&oe=..&_nc_sid=..", exactly like
-	// the directPath field of a real protobuf message. Stripping the query drops
-	// the oh/oe signature and produces a malformed URL — the CDN answers 403.
-	//
-	// This only started mattering after the 2026-08-04 whatsmeow bump: the older
-	// Download() honoured GetURL() (the full signed URL) and never touched
-	// directPath. The current one ignores GetURL() entirely and always goes
-	// through DownloadMediaWithPath.
-	return "/" + pathPart
+	// Keep the query string: it carries the CDN auth tokens (oh=/oe=).
+	// whatsmeow's Download rebuilds the URL as host + directPath + "&hash=..."
+	// and the CDN returns 403 if the auth params are missing.
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality.
@@ -1896,6 +2374,9 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		return withAuth(token, allowedHosts, h)
 	}
 	mux := http.NewServeMux()
+
+	// On-demand history sync endpoint (see history_ondemand.go)
+	registerHistoryEndpoint(mux, auth, client, messageStore)
 
 	// Health check endpoint
 	mux.HandleFunc("/api/health", auth(func(w http.ResponseWriter, r *http.Request) {
@@ -1964,7 +2445,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			req.Recipient, len(req.Message), resolvedMediaPath != "")
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
 		fmt.Printf("← /api/send success=%v status=%q\n", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1979,6 +2460,166 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			Success: success,
 			Message: message,
 		})
+	}))
+
+	// Handler for explicitly sending read receipts for selected messages.
+	mux.HandleFunc("/api/mark-read", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || len(req.MessageIDs) == 0 {
+			http.Error(w, "chat_jid and message_ids are required", http.StatusBadRequest)
+			return
+		}
+
+		messageIDs := make([]types.MessageID, len(req.MessageIDs))
+		for i, id := range req.MessageIDs {
+			if strings.TrimSpace(id) == "" {
+				http.Error(w, "message_ids must not contain empty values", http.StatusBadRequest)
+				return
+			}
+			messageIDs[i] = types.MessageID(id)
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil || chatJID.User == "" || chatJID.Server == "" {
+			http.Error(w, "Invalid chat_jid", http.StatusBadRequest)
+			return
+		}
+
+		senderJID := types.EmptyJID
+		if req.SenderJID != "" {
+			if strings.Contains(req.SenderJID, "@") {
+				senderJID, err = types.ParseJID(req.SenderJID)
+			} else {
+				senderJID = types.NewJID(strings.TrimSpace(req.SenderJID), types.DefaultUserServer)
+			}
+			if err != nil || senderJID.User == "" || senderJID.Server == "" {
+				http.Error(w, "Invalid sender_jid", http.StatusBadRequest)
+				return
+			}
+		} else if chatJID.Server == types.GroupServer {
+			http.Error(w, "sender_jid is required for group read receipts", http.StatusBadRequest)
+			return
+		}
+
+		readAt := time.Now()
+		if req.Timestamp != "" {
+			readAt, err = time.Parse(time.RFC3339, req.Timestamp)
+			if err != nil {
+				http.Error(w, "timestamp must be RFC 3339", http.StatusBadRequest)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "WhatsApp client is not connected. Please wait for reconnection.",
+			})
+			return
+		}
+
+		// Validate against the storage (phone-form) chat JID before any
+		// external side effect. LID rewrite happens only for the receipt.
+		if err := messageStore.ValidateInboundMarkRead(req.ChatJID, req.SenderJID, req.MessageIDs); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// MCP storage normalizes chats/senders to phone JIDs; MarkRead routes
+		// the receipt `to`/`participant` as given, so resolve PN -> LID the
+		// same way sendWhatsAppMessage does or migrated contacts silently fail.
+		chatJID, err = resolveRecipientJID(client, req.ChatJID)
+		if err != nil || chatJID.User == "" || chatJID.Server == "" {
+			http.Error(w, "Invalid chat_jid", http.StatusBadRequest)
+			return
+		}
+		if req.SenderJID != "" {
+			senderJID, err = resolveRecipientJID(client, req.SenderJID)
+			if err != nil || senderJID.User == "" || senderJID.Server == "" {
+				http.Error(w, "Invalid sender_jid", http.StatusBadRequest)
+				return
+			}
+		}
+
+		if err := client.MarkRead(context.Background(), messageIDs, readAt, chatJID, senderJID); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+
+		// Advance the local read marker immediately so list_chats unread
+		// clears without waiting for the self-read receipt round-trip.
+		localReadAt := readAt
+		if ts, ok, tsErr := messageStore.MaxMessageTimestamp(req.ChatJID, req.MessageIDs); tsErr == nil && ok {
+			localReadAt = ts
+		}
+		if err := messageStore.MarkChatRead(req.ChatJID, localReadAt); err != nil {
+			// Receipt already sent; log but still report success to the caller.
+			fmt.Printf("Warning: failed to persist local read marker for %s: %v\n", req.ChatJID, err)
+		}
+
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Messages marked as read"})
+	}))
+
+	// Handler for sending (or removing) emoji reactions
+	mux.HandleFunc("/api/react", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req ReactRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Recipient == "" || req.MessageID == "" || req.Emoji == nil {
+			http.Error(w, "recipient, message_id, and emoji are required", http.StatusBadRequest)
+			return
+		}
+		chatJID, err := types.ParseJID(req.Recipient)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid recipient JID: %v", err), http.StatusBadRequest)
+			return
+		}
+		var senderJID types.JID
+		switch {
+		case req.FromMe:
+			if client.Store.ID == nil {
+				http.Error(w, "Not logged in", http.StatusServiceUnavailable)
+				return
+			}
+			senderJID = *client.Store.ID
+		case req.SenderJID != "":
+			if senderJID, err = types.ParseJID(req.SenderJID); err != nil {
+				http.Error(w, fmt.Sprintf("Invalid sender_jid: %v", err), http.StatusBadRequest)
+				return
+			}
+			if senderJID.User == "" || senderJID.Server == "" {
+				http.Error(w, "Invalid sender_jid", http.StatusBadRequest)
+				return
+			}
+		default:
+			if chatJID.Server == types.GroupServer {
+				http.Error(w, "sender_jid is required for group reactions when from_me is false", http.StatusBadRequest)
+				return
+			}
+			senderJID = chatJID
+		}
+		msg := client.BuildReaction(chatJID, senderJID, req.MessageID, *req.Emoji)
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := client.SendMessage(context.Background(), chatJID, msg); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 	}))
 
 	// Handler for sending native polls.
@@ -2196,6 +2837,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	}()
 }
 
+func webhookStartupMessage(forwardSelf bool) string {
+	if !webhooksEnabled() {
+		return "WEBHOOK_ENABLED=false: outbound webhooks disabled"
+	}
+	if forwardSelf {
+		return "FORWARD_SELF enabled: forwarding self messages to webhook"
+	}
+	return "FORWARD_SELF disabled: self messages will NOT be forwarded"
+}
+
 func main() {
 	flag.Parse()
 
@@ -2203,11 +2854,7 @@ func main() {
 	logger := waLog.Stdout("Client", "DEBUG", true)
 	logger.Infof("Starting WhatsApp client...")
 
-	if forwardSelfMessages {
-		logger.Infof("FORWARD_SELF enabled: forwarding self messages to webhook")
-	} else {
-		logger.Infof("FORWARD_SELF disabled: self messages will NOT be forwarded")
-	}
+	logger.Infof("%s", webhookStartupMessage(forwardSelfMessages))
 
 	chatFilter = NewChatFilter("store/ignore-chats.json")
 	logger.Infof("Chat filter loaded from store/ignore-chats.json (%d chats ignored)", len(chatFilter.ignored))
@@ -2264,6 +2911,21 @@ func main() {
 		logger.Infof("--full-history-pair enabled: requesting full history (days=3650, sizeMb=102400)")
 	}
 
+	// Set the linked-device label shown in WhatsApp's "Linked Devices" list.
+	// whatsmeow's built-in default is the literal string "whatsmeow", which is
+	// opaque to end users who then see an unfamiliar name attached to their
+	// account. WHATSAPP_DEVICE_NAME lets an operator show a recognisable label
+	// (e.g. a product or company name) instead. Empty/unset keeps the whatsmeow
+	// default. This only takes effect at pair time — an already-paired session
+	// (whatsapp.db present) keeps the name captured when the QR was scanned; to
+	// change it, re-pair. The platform icon (DeviceProps.PlatformType) is left
+	// at whatsmeow's default on purpose: this is a labelling convenience, not a
+	// way to impersonate an official WhatsApp client.
+	if name := resolveDeviceName(); name != "" {
+		store.DeviceProps.Os = proto.String(name)
+		logger.Infof("Linked-device name set to %q (WHATSAPP_DEVICE_NAME)", name)
+	}
+
 	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
 	if client == nil {
@@ -2289,6 +2951,46 @@ func main() {
 		return
 	}
 
+	// Resolve the REST API port. Pure env parsing with no dependency on the
+	// WhatsApp connection, so it's safe to do this early alongside the token
+	// load below — and failing fast here means we don't run a QR-pairing
+	// flow only to error out on an invalid port afterwards.
+	port := 8080
+	if p := os.Getenv("WHATSAPP_BRIDGE_PORT"); p != "" {
+		v, err := strconv.Atoi(p)
+		if err != nil || v < 1 || v > 65535 {
+			logger.Errorf("Invalid WHATSAPP_BRIDGE_PORT=%q, must be 1-65535", p)
+			return
+		}
+		port = v
+	}
+
+	// Load (or generate on first run) the bearer token used to authenticate
+	// REST callers, and attach it to outbound webhook POSTs so the hub's
+	// fail-closed inbound-auth middleware accepts them (see auth.go and
+	// webhook.go). This MUST happen before the event handler below is
+	// registered: WhatsApp can deliver messages — including a burst of
+	// history-sync backlog — as soon as the connection succeeds, and any
+	// message handled before this assignment would go out with no bridge
+	// token attached.
+	bridgeToken, fresh, tokErr := loadOrCreateBridgeToken()
+	if tokErr != nil {
+		logger.Errorf("Failed to initialize bridge token: %v", tokErr)
+		return
+	}
+	webhookAuthToken = bridgeToken
+
+	// Print the one-time setup banner immediately, before attempting to
+	// connect/pair. loadOrCreateBridgeToken() already persisted the token to
+	// disk as soon as it generated one; if the banner instead waited until
+	// after a successful connection (as it used to), a QR-pairing timeout or
+	// early exit would leave a token on disk that was never shown to the
+	// user — and loadOrCreateBridgeToken() would report fresh=false on every
+	// later run, so the banner would never get a second chance to print it.
+	if fresh {
+		printTokenBanner(bridgeToken, port)
+	}
+
 	// Channel to signal reconnection needs
 	reconnectChan := make(chan bool, 1)
 
@@ -2299,9 +3001,38 @@ func main() {
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
 
+		case *events.UndecryptableMessage:
+			// The first (failed) delivery carries the original send-time. WhatsApp
+			// re-sends after our retry receipt, but that copy's `t` is the resend
+			// time — so stash the original now and reuse it in handleMessage.
+			rememberOriginalTimestamp(v.Info.ID, v.Info.Timestamp)
+
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.Receipt:
+			// Persist read state so consumers can distinguish genuine unread
+			// from "latest message is inbound". Only our own reads count.
+			if isSelfReadReceipt(v) {
+				chatJID := resolveLIDChat(client, v.Chat, v.SenderAlt, v.RecipientAlt, v.IsFromMe).String()
+				// Prefer the acknowledged messages' timestamps over the
+				// receipt event time so out-of-order delivery cannot advance
+				// the marker past an unread message.
+				readAt := v.Timestamp
+				ids := make([]string, len(v.MessageIDs))
+				for i, id := range v.MessageIDs {
+					ids[i] = string(id)
+				}
+				if ts, ok, err := messageStore.MaxMessageTimestamp(chatJID, ids); err != nil {
+					logger.Warnf("Failed to look up read receipt message times for %s: %v", chatJID, err)
+				} else if ok {
+					readAt = ts
+				}
+				if err := messageStore.MarkChatRead(chatJID, readAt); err != nil {
+					logger.Warnf("Failed to mark chat %s read: %v", chatJID, err)
+				}
+			}
 
 		case *events.GroupInfo:
 			if v.Ephemeral != nil {
@@ -2499,30 +3230,11 @@ connectionSuccess:
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	port := 8080
-	if p := os.Getenv("WHATSAPP_BRIDGE_PORT"); p != "" {
-		v, err := strconv.Atoi(p)
-		if err != nil || v < 1 || v > 65535 {
-			logger.Errorf("Invalid WHATSAPP_BRIDGE_PORT=%q, must be 1-65535", p)
-			return
-		}
-		port = v
-	}
+	// port and bridgeToken were already resolved above, before the connect/
+	// pairing loop, so the setup banner could print immediately.
 
-	// Load (or generate on first run) the bearer token used to authenticate
-	// REST callers, and resolve the allow-listed roots that media_path values
-	// in /api/send must live under. See auth.go and media_path.go for the
-	// rationale.
-	bridgeToken, fresh, tokErr := loadOrCreateBridgeToken()
-	if tokErr != nil {
-		logger.Errorf("Failed to initialize bridge token: %v", tokErr)
-		return
-	}
-	if fresh {
-		printTokenBanner(bridgeToken, port)
-	}
-
+	// Resolve the allow-listed roots that media_path values in /api/send must
+	// live under. See media_path.go for the rationale.
 	allowedMediaRoots, mrErr := resolveMediaRoots()
 	if mrErr != nil {
 		logger.Errorf("Failed to resolve media roots: %v", mrErr)
@@ -2615,17 +3327,17 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			var displayName, convName *string
 			// Try to extract the fields we care about regardless of the exact type
 			v := reflect.ValueOf(conversation)
-			if v.Kind() == reflect.Ptr && !v.IsNil() {
+			if v.Kind() == reflect.Pointer && !v.IsNil() {
 				v = v.Elem()
 
 				// Try to find DisplayName field
-				if displayNameField := v.FieldByName("DisplayName"); displayNameField.IsValid() && displayNameField.Kind() == reflect.Ptr && !displayNameField.IsNil() {
+				if displayNameField := v.FieldByName("DisplayName"); displayNameField.IsValid() && displayNameField.Kind() == reflect.Pointer && !displayNameField.IsNil() {
 					dn := displayNameField.Elem().String()
 					displayName = &dn
 				}
 
 				// Try to find Name field
-				if nameField := v.FieldByName("Name"); nameField.IsValid() && nameField.Kind() == reflect.Ptr && !nameField.IsNil() {
+				if nameField := v.FieldByName("Name"); nameField.IsValid() && nameField.Kind() == reflect.Pointer && !nameField.IsNil() {
 					n := nameField.Elem().String()
 					convName = &n
 				}
@@ -2655,22 +3367,55 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
+		// Use contact info (full name)
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
 		} else {
-			// Last fallback to JID
-			name = jid.User
+			name = lookupLocalContactName(client, messageStore, chatJID, logger)
+
+			if name == "" {
+				if sender != "" {
+					name = sender
+				} else {
+					name = jid.User
+				}
+			}
 		}
 
 		logger.Infof("Using contact name: %s", name)
 	}
 
 	return name
+}
+
+func lookupLocalContactName(client *whatsmeow.Client, messageStore *MessageStore, chatJID string, logger waLog.Logger) string {
+	if client == nil || client.Store == nil || client.Store.ID == nil || messageStore == nil || messageStore.waDB == nil {
+		return ""
+	}
+
+	var localName string
+	err := messageStore.waDB.QueryRow(
+		`SELECT COALESCE(
+			NULLIF(full_name, ''),
+			NULLIF(push_name, ''),
+			NULLIF(first_name, ''),
+			NULLIF(business_name, ''),
+			''
+		) FROM whatsmeow_contacts WHERE our_jid = ? AND their_jid = ?`,
+		client.Store.ID.String(),
+		chatJID,
+	).Scan(&localName)
+	if err == nil {
+		if localName != "" {
+			logger.Infof("Using local contact name for %s: %s", chatJID, localName)
+		}
+		return localName
+	}
+	if err != sql.ErrNoRows && !strings.Contains(err.Error(), "no such table: whatsmeow_contacts") {
+		logger.Warnf("Failed to query local contact name for %s: %v", chatJID, err)
+	}
+	return ""
 }
 
 // callChatJID resolves the chat JID that a call belongs to. For group calls
@@ -2786,6 +3531,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			timestamp := time.Unix(int64(ts), 0)
 
 			_ = messageStore.StoreChat(chatJID, name, timestamp)
+			// Backfill read state only when WhatsApp explicitly reports unread
+			// metadata. Sparse history-sync chunks omit UnreadCount; the
+			// generated getter then returns 0 and would permanently mark the
+			// chat read under the monotonic merge.
+			if conversation.UnreadCount != nil &&
+				conversation.GetUnreadCount() == 0 &&
+				!conversation.GetMarkedAsUnread() {
+				if err := messageStore.MarkChatRead(chatJID, timestamp); err != nil {
+					logger.Warnf("Failed to backfill read state for %s: %v", chatJID, err)
+				}
+			}
 			if err := messageStore.UpdateChatEphemeralSettings(
 				chatJID,
 				conversation.GetEphemeralExpiration(),
@@ -2890,6 +3646,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					"", // quoted_message_id: history sync does not carry ContextInfo
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)

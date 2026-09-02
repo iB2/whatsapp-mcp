@@ -11,19 +11,18 @@ import requests
 import audio
 
 # Configuration via environment variables with sensible defaults
+_DEFAULT_BRIDGE_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store")
 MESSAGES_DB_PATH = os.getenv(
     "WHATSAPP_DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store", "messages.db"),
+    os.path.join(_DEFAULT_BRIDGE_STORE_DIR, "messages.db"),
 )
 WHATSMEOW_DB_PATH = os.getenv(
     "WHATSMEOW_DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store", "whatsapp.db"),
+    os.path.join(_DEFAULT_BRIDGE_STORE_DIR, "whatsapp.db"),
 )
 WHATSAPP_API_BASE_URL = os.getenv("WHATSAPP_API_URL", "http://localhost:8080/api")
 
-_BRIDGE_TOKEN_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store", ".bridge-token"
-)
+_BRIDGE_TOKEN_PATH = os.path.join(os.path.dirname(WHATSMEOW_DB_PATH), ".bridge-token")
 
 
 def _read_bridge_token() -> str | None:
@@ -57,6 +56,11 @@ class Message:
     id: str
     chat_name: str | None = None
     media_type: str | None = None
+    # For media_type == "reaction", the bridge stores the reacted-to message ID
+    # in the `filename` column. Exposed to callers as `reaction_to_message_id`.
+    filename: str | None = None
+    # ID of the message this one is replying to (NULL for non-replies).
+    quoted_message_id: str | None = None
 
 
 @dataclass
@@ -67,11 +71,36 @@ class Chat:
     last_message: str | None = None
     last_sender: str | None = None
     last_is_from_me: bool | None = None
+    # Bridge read marker (chats.last_read_time): how far we have read this
+    # chat, from read receipts and history-sync backfill. NULL when the
+    # bridge has never seen a read for the chat, or predates the column.
+    last_read_time: datetime | None = None
 
     @property
     def is_group(self) -> bool:
         """Determine if chat is a group based on JID pattern."""
         return self.jid.endswith("@g.us")
+
+    @property
+    def unread(self) -> bool:
+        """Whether the chat's last message is inbound and unread by us.
+
+        With a read marker this is genuine unread — a chat read on the phone
+        or another linked device is not reported. Without one (older bridge,
+        or a chat WhatsApp never reported a read for) it degrades to the old
+        heuristic: unread if the last message is inbound.
+
+        A missing last-message row (`last_is_from_me is None`) cannot establish
+        direction — protocol/unsupported events can advance last_message_time
+        without storing a message — so those chats are not reported as unread.
+        """
+        if self.last_message_time is None or self.last_is_from_me is None:
+            return False
+        if self.last_is_from_me:
+            return False
+        if self.last_read_time is None:
+            return True
+        return self.last_message_time > self.last_read_time
 
 
 @dataclass
@@ -121,6 +150,8 @@ def msg_to_dict(message: Message, include_sender_name: bool = True) -> dict[str,
         "chat_jid": message.chat_jid,
         "chat_name": message.chat_name,
         "media_type": message.media_type,
+        "reaction_to_message_id": (message.filename if message.media_type == "reaction" else None),
+        "quoted_message_id": message.quoted_message_id,
     }
 
 
@@ -134,12 +165,44 @@ def chat_to_dict(chat: "Chat") -> dict[str, Any]:
         "last_message": chat.last_message,
         "last_sender": chat.last_sender,
         "last_is_from_me": chat.last_is_from_me,
+        "last_read_time": chat.last_read_time.isoformat() if chat.last_read_time else None,
+        "unread": chat.unread,
     }
 
 
 def contact_to_dict(contact: "Contact") -> dict[str, Any]:
     """Convert a Contact dataclass to a dictionary for JSON serialization."""
     return {"phone_number": contact.phone_number, "name": contact.name, "jid": contact.jid}
+
+
+def _last_read_time_select(cursor: sqlite3.Cursor, table_alias: str) -> str:
+    """SELECT expression for chats.last_read_time, or a NULL literal.
+
+    The bridge adds the column through its own migration, so a messages.db
+    written by an older bridge doesn't have it yet. Reads must keep working
+    against such a store — those chats simply report last_read_time = None.
+    """
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(chats)").fetchall()}
+    return f"{table_alias}.last_read_time" if "last_read_time" in columns else "NULL"
+
+
+def _last_message_join(chat_alias: str, msg_alias: str) -> str:
+    """Deterministic single-row join to the chat's latest message.
+
+    Multiple messages can share last_message_time (history sync is second-
+    resolution). Joining solely on timestamp would duplicate chat rows and
+    make last_is_from_me / unread non-deterministic; pick one id as tie-break.
+    """
+    return f"""
+            LEFT JOIN messages {msg_alias} ON {chat_alias}.jid = {msg_alias}.chat_jid
+                AND {msg_alias}.id = (
+                    SELECT m.id FROM messages m
+                    WHERE m.chat_jid = {chat_alias}.jid
+                      AND m.timestamp = {chat_alias}.last_message_time
+                    ORDER BY m.id DESC
+                    LIMIT 1
+                )
+    """
 
 
 def _sender_aliases(value: str) -> list[str]:
@@ -383,7 +446,7 @@ def list_messages(
 
         # Build base query
         query_parts = [
-            "SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"
+            "SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename FROM messages"
         ]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
@@ -448,6 +511,8 @@ def list_messages(
                 chat_jid=msg[5],
                 id=msg[6],
                 media_type=msg[7],
+                quoted_message_id=msg[8] if len(msg) > 8 else None,
+                filename=msg[9] if len(msg) > 9 else None,
             )
             result.append(message)
 
@@ -491,7 +556,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
         # Get the target message first
         cursor.execute(
             """
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.quoted_message_id, messages.filename
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.id = ?
@@ -512,12 +577,14 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
             chat_jid=msg_data[5],
             id=msg_data[6],
             media_type=msg_data[8],
+            quoted_message_id=msg_data[9] if len(msg_data) > 9 else None,
+            filename=msg_data[10] if len(msg_data) > 10 else None,
         )
 
         # Get messages before
         cursor.execute(
             """
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
@@ -539,13 +606,15 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
                     chat_jid=msg[5],
                     id=msg[6],
                     media_type=msg[7],
+                    quoted_message_id=msg[8] if len(msg) > 8 else None,
+                    filename=msg[9] if len(msg) > 9 else None,
                 )
             )
 
         # Get messages after
         cursor.execute(
             """
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
@@ -567,6 +636,8 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
                     chat_jid=msg[5],
                     id=msg[6],
                     media_type=msg[7],
+                    quoted_message_id=msg[8] if len(msg) > 8 else None,
+                    filename=msg[9] if len(msg) > 9 else None,
                 )
             )
 
@@ -596,19 +667,14 @@ def list_chats(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
-        # Build base query. The last-message columns are referenced by tuple
-        # index downstream, so we keep the result shape constant and emit
-        # static NULLs when the messages table is not joined — otherwise the
-        # SELECT references messages.* with no FROM/JOIN and SQLite errors
-        # out with "no such column: messages.content".
+        # The last message is always joined — is_from_me feeds the unread
+        # flag — but its content is only selected when asked for. The columns
+        # are referenced by tuple index downstream, so the result shape stays
+        # constant across the branch.
         if include_last_message:
-            last_message_select = (
-                "messages.content as last_message, "
-                "messages.sender as last_sender, "
-                "messages.is_from_me as last_is_from_me"
-            )
+            last_message_select = "messages.content as last_message, messages.sender as last_sender"
         else:
-            last_message_select = "NULL as last_message, NULL as last_sender, NULL as last_is_from_me"
+            last_message_select = "NULL as last_message, NULL as last_sender"
 
         query_parts = [
             f"""
@@ -616,16 +682,13 @@ def list_chats(
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                {last_message_select}
+                {last_message_select},
+                messages.is_from_me as last_is_from_me,
+                {_last_read_time_select(cursor, "chats")}
             FROM chats
+            {_last_message_join("chats", "messages")}
         """
         ]
-
-        if include_last_message:
-            query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid
-                AND chats.last_message_time = messages.timestamp
-            """)
 
         where_clauses = []
         params = []
@@ -661,6 +724,7 @@ def list_chats(
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5],
+                last_read_time=datetime.fromisoformat(chat_data[6]) if chat_data[6] else None,
             )
             result.append(chat_to_dict(chat))
 
@@ -767,12 +831,18 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
                 c.jid,
                 c.name,
                 c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                last_msg.content as last_message,
+                last_msg.sender as last_sender,
+                last_msg.is_from_me as last_is_from_me,
+                {_last_read_time_select(cursor, "c")}
             FROM chats c
-            JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender IN ({placeholders}) OR c.jid = ?
+            {_last_message_join("c", "last_msg")}
+            WHERE EXISTS (
+                SELECT 1
+                FROM messages contact_msg
+                WHERE contact_msg.chat_jid = c.jid
+                    AND contact_msg.sender IN ({placeholders})
+            ) OR c.jid = ?
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
         """,
@@ -790,6 +860,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5],
+                last_read_time=datetime.fromisoformat(chat_data[6]) if chat_data[6] else None,
             )
             result.append(chat_to_dict(chat))
 
@@ -874,30 +945,25 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
-        # See list_chats: keep result tuple shape stable across the
-        # include_last_message branch by emitting static NULLs when we
-        # don't JOIN the messages table.
+        # See list_chats: the last message is always joined for is_from_me,
+        # and the result tuple shape stays stable across the branch.
         if include_last_message:
-            last_message_select = "m.content as last_message, m.sender as last_sender, m.is_from_me as last_is_from_me"
+            last_message_select = "m.content as last_message, m.sender as last_sender"
         else:
-            last_message_select = "NULL as last_message, NULL as last_sender, NULL as last_is_from_me"
+            last_message_select = "NULL as last_message, NULL as last_sender"
 
         query = f"""
             SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
-                {last_message_select}
+                {last_message_select},
+                m.is_from_me as last_is_from_me,
+                {_last_read_time_select(cursor, "c")}
             FROM chats c
+            {_last_message_join("c", "m")}
+            WHERE c.jid = ?
         """
-
-        if include_last_message:
-            query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid
-                AND c.last_message_time = m.timestamp
-            """
-
-        query += " WHERE c.jid = ?"
 
         cursor.execute(query, (chat_jid,))
         chat_data = cursor.fetchone()
@@ -912,6 +978,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
             last_message=chat_data[3],
             last_sender=chat_data[4],
             last_is_from_me=chat_data[5],
+            last_read_time=datetime.fromisoformat(chat_data[6]) if chat_data[6] else None,
         )
         return chat_to_dict(chat)
 
@@ -930,17 +997,17 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
         cursor = conn.cursor()
 
         cursor.execute(
-            """
+            f"""
             SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                m.is_from_me as last_is_from_me,
+                {_last_read_time_select(cursor, "c")}
             FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid
-                AND c.last_message_time = m.timestamp
+            {_last_message_join("c", "m")}
             WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
             LIMIT 1
         """,
@@ -959,6 +1026,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
             last_message=chat_data[3],
             last_sender=chat_data[4],
             last_is_from_me=chat_data[5],
+            last_read_time=datetime.fromisoformat(chat_data[6]) if chat_data[6] else None,
         )
         return chat_to_dict(chat)
 
@@ -970,17 +1038,30 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
             conn.close()
 
 
-def send_message(recipient: str, message: str) -> tuple[bool, str]:
+def send_message(
+    recipient: str,
+    message: str,
+    quoted_message_id: str = "",
+    quoted_sender_jid: str = "",
+    quoted_content: str = "",
+    mentions: list[str] | None = None,
+) -> tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {
+        payload: dict[str, Any] = {
             "recipient": recipient,
             "message": message,
         }
+        if quoted_message_id:
+            payload["quoted_message_id"] = quoted_message_id
+            payload["quoted_sender_jid"] = quoted_sender_jid
+            payload["quoted_content"] = quoted_content
+        if mentions:
+            payload["mentions"] = mentions
 
         response = requests.post(url, json=payload, headers=_bridge_headers())
 
@@ -1050,7 +1131,13 @@ def send_poll(
         return False, f"Unexpected error: {str(e)}"
 
 
-def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
+def send_file(recipient: str, media_path: str, caption: str = "") -> tuple[bool, str]:
+    """Send a media file (image, video, document) with an optional caption.
+
+    The bridge populates the WA media-message Caption field from `message`, so
+    passing both in one /api/send call produces a single attachment-with-caption
+    message instead of two separate messages.
+    """
     try:
         # Validate input
         if not recipient:
@@ -1064,6 +1151,8 @@ def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {"recipient": recipient, "media_path": media_path}
+        if caption:
+            payload["message"] = caption
 
         response = requests.post(url, json=payload, headers=_bridge_headers())
 
@@ -1111,6 +1200,103 @@ def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def send_reaction(
+    recipient: str,
+    message_id: str,
+    emoji: str,
+    from_me: bool = False,
+    sender_jid: str = "",
+) -> tuple[bool, str]:
+    """Send (or remove) a reaction to a WhatsApp message.
+
+    Args:
+        recipient: The chat JID the message belongs to (phone JID or group JID).
+        message_id: The ID of the message to react to.
+        emoji: The reaction emoji. Pass an empty string to remove an existing reaction.
+        from_me: Whether the original message was sent by the current user.
+        sender_jid: JID of the original message sender (required for group messages
+                    when from_me is False so the bridge can build the correct key).
+
+    Returns:
+        Tuple of (success, status_message).
+    """
+    try:
+        if not recipient:
+            return False, "Recipient must be provided"
+        if not message_id:
+            return False, "Message ID must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/react"
+        payload: dict[str, Any] = {
+            "recipient": recipient,
+            "message_id": message_id,
+            "emoji": emoji,
+            "from_me": from_me,
+            "sender_jid": sender_jid,
+        }
+
+        response = requests.post(url, json=payload, headers=_bridge_headers())
+
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("ok"):
+                return True, "Reaction sent"
+            return False, result.get("error", "Unknown error")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def mark_messages_read(
+    message_ids: list[str],
+    chat_jid: str,
+    sender_jid: str = "",
+    timestamp: str | None = None,
+) -> tuple[bool, str]:
+    """Mark selected messages as read through the WhatsApp bridge."""
+    try:
+        normalized_ids = [message_id.strip() for message_id in message_ids]
+        if not normalized_ids or any(not message_id for message_id in normalized_ids):
+            return False, "At least one non-empty message ID must be provided"
+        if not chat_jid:
+            return False, "Chat JID must be provided"
+        if chat_jid.endswith("@g.us") and not sender_jid:
+            return False, "Sender JID must be provided for group read receipts"
+
+        payload: dict[str, Any] = {
+            "message_ids": normalized_ids,
+            "chat_jid": chat_jid,
+        }
+        if sender_jid:
+            payload["sender_jid"] = sender_jid
+        if timestamp:
+            payload["timestamp"] = timestamp
+
+        response = requests.post(
+            f"{WHATSAPP_API_BASE_URL}/mark-read",
+            json=payload,
+            headers=_bridge_headers(),
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
 
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
