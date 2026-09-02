@@ -84,14 +84,15 @@ def test_list_chats_with_last_message(messages_db):
 
 def test_list_chats_without_last_message(messages_db):
     """Regression: include_last_message=False must not error and must
-    still return the chat row with NULL last-message fields."""
+    still return the chat row without the last message's content."""
     chats = whatsapp.list_chats(limit=10, include_last_message=False)
     assert len(chats) == 1
     assert chats[0]["jid"] == "1234567890@s.whatsapp.net"
     assert chats[0]["name"] == "Alice"
     assert chats[0]["last_message"] is None
     assert chats[0]["last_sender"] is None
-    assert chats[0]["last_is_from_me"] is None
+    # is_from_me is always joined — the unread flag is derived from it.
+    assert chats[0]["last_is_from_me"] == 0
 
 
 def test_list_chats_query_filter_with_include_last_message_false(messages_db):
@@ -119,9 +120,58 @@ def test_get_chat_without_last_message(messages_db):
     assert chat["name"] == "Alice"
     assert chat["last_message"] is None
     assert chat["last_sender"] is None
-    assert chat["last_is_from_me"] is None
+    assert chat["last_is_from_me"] == 0
 
 
 def test_get_chat_missing_jid_returns_none(messages_db):
     assert whatsapp.get_chat("nonexistent@s.whatsapp.net") is None
     assert whatsapp.get_chat("nonexistent@s.whatsapp.net", include_last_message=False) is None
+
+
+def test_get_contact_chats_returns_each_chat_once_with_last_message(messages_db):
+    conn = sqlite3.connect(messages_db)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+        ("group-1@g.us", "Group", "2024-01-15 10:40:00+00:00"),
+    )
+    cursor.executemany(
+        """INSERT INTO messages
+           (id, chat_jid, sender, content, timestamp, is_from_me)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                "group-msg-1",
+                "group-1@g.us",
+                "1234567890@s.whatsapp.net",
+                "contact's earlier group message",
+                "2024-01-15 10:35:00+00:00",
+                0,
+            ),
+            (
+                "group-msg-2",
+                "group-1@g.us",
+                "1234567890@s.whatsapp.net",
+                "contact's later group message",
+                "2024-01-15 10:36:00+00:00",
+                0,
+            ),
+            (
+                "group-last",
+                "group-1@g.us",
+                "9999999999@s.whatsapp.net",
+                "actual chat last message",
+                "2024-01-15 10:40:00+00:00",
+                0,
+            ),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    chats = whatsapp.get_contact_chats("1234567890@s.whatsapp.net")
+    group_chats = [chat for chat in chats if chat["jid"] == "group-1@g.us"]
+
+    assert len(group_chats) == 1
+    assert group_chats[0]["last_message"] == "actual chat last message"
+    assert group_chats[0]["last_sender"] == "9999999999@s.whatsapp.net"

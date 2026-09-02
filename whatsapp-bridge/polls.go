@@ -318,7 +318,7 @@ func sendWhatsAppPoll(client *whatsmeow.Client, messageStore *MessageStore, req 
 		}
 		if storeErr := messageStore.StoreMessage(
 			resp.ID, chatJID, client.Store.ID.User, formatPollContent(question, options), timestamp, true,
-			"", "", "", nil, nil, nil, 0,
+			"", "", "", nil, nil, nil, 0, "",
 		); storeErr != nil {
 			fmt.Printf("Warning: failed to persist outbound poll message: %v\n", storeErr)
 		}
@@ -379,7 +379,7 @@ func handlePollUpdate(client *whatsmeow.Client, messageStore *MessageStore, msg 
 
 	if err := messageStore.StoreMessage(
 		msg.Info.ID, chatJID, sender, formatPollVoteContent(question, selected),
-		msg.Info.Timestamp, msg.Info.IsFromMe, "", "", "", nil, nil, nil, 0,
+		msg.Info.Timestamp, msg.Info.IsFromMe, "", "", "", nil, nil, nil, 0, "",
 	); err != nil {
 		logger.Warnf("Failed to persist poll vote message %s: %v", msg.Info.ID, err)
 	}
