@@ -1140,8 +1140,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
-				FileName:      proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				// filepath.Base handles BOTH separators. The manual LastIndex(mediaPath,"/")
+				// cut returned -1 on Windows (EvalSymlinks normalises the path to "\"),
+				// so the whole absolute path leaked as the document name to the recipient.
+				Title:         proto.String(filepath.Base(mediaPath)),
+				FileName:      proto.String(filepath.Base(mediaPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
